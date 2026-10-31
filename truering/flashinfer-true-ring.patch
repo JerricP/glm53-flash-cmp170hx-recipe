@@ -1,0 +1,170 @@
+diff -ruN a/comm/pcie_ipc_policy.py b/comm/pcie_ipc_policy.py
+--- a/comm/pcie_ipc_policy.py
++++ b/comm/pcie_ipc_policy.py
+@@ -55,6 +55,8 @@
+     STAGED = 1
+     STAGED_RING = 2
+     FLAT_STAGED = 3
++    # dsv41 (ds41-patches/patch_true_ring.py): cut-through neighbour ring, world size 4 only
++    TRUE_RING = 4
+ 
+ 
+ @dataclass(frozen=True)
+@@ -154,6 +156,10 @@
+         return False
+     if config.variant == IpcVariant.FLAT_STAGED and world_size != 8:
+         return False
++    # Every block spins on packs written by the same block index of the previous rank, so all blocks must be
++    # resident at once; 16 is far below occupancy even beside the decode kernels.
++    if config.variant == IpcVariant.TRUE_RING and (world_size != 4 or config.blocks > 16):
++        return False
+     # The block-partitioned TP8 kernel derives its chunk from blockIdx.x & 3.
+     # Every other kernel uses flat grid-stride loops.
+     if (
+diff -ruN a/comm/pcie_ipc_tuning.py b/comm/pcie_ipc_tuning.py
+--- a/comm/pcie_ipc_tuning.py
++++ b/comm/pcie_ipc_tuning.py
+@@ -67,7 +67,7 @@
+ # candidate encoding changes. The autotuner's own metadata records library and
+ # driver versions but nothing about this op, and a dev checkout does not move
+ # the FlashInfer version.
+-PCIE_IPC_TUNE_VERSION = 1
++PCIE_IPC_TUNE_VERSION = 2  # dsv41: + IpcVariant.TRUE_RING
+ 
+ # Not all powers of two: the extra entries are block counts the search selected
+ # on real hardware, and it cannot converge on a configuration its own grid
+diff -ruN a/data/csrc/pcie_ipc_all_reduce.cu b/data/csrc/pcie_ipc_all_reduce.cu
+--- a/data/csrc/pcie_ipc_all_reduce.cu
++++ b/data/csrc/pcie_ipc_all_reduce.cu
+@@ -163,6 +163,8 @@
+   TVM_FFI_ICHECK(
+       !(h->world_size == 2 && algo != fi::Variant::kUnstaged && algo != fi::Variant::kStaged))
+       << "world_size 2 accepts only kUnstaged and kStaged, got variant " << variant;
++  TVM_FFI_ICHECK(!(algo == fi::Variant::kTrueRing && h->world_size != 4))
++      << "kTrueRing (dsv41) is world_size 4 only";
+   TVM_FFI_ICHECK(!(algo == fi::Variant::kFlatStaged && h->world_size != 8))
+       << "kFlatStaged is world_size 8 only, got " << h->world_size;
+   // Only the block-partitioned TP8 kernel needs this: it derives its chunk
+diff -ruN a/data/include/flashinfer/comm/pcie_ipc_all_reduce.cuh b/data/include/flashinfer/comm/pcie_ipc_all_reduce.cuh
+--- a/data/include/flashinfer/comm/pcie_ipc_all_reduce.cuh
++++ b/data/include/flashinfer/comm/pcie_ipc_all_reduce.cuh
+@@ -58,9 +58,10 @@
+   kStaged = 1,      // staged pushes; island-decomposed at world_size 8
+   kStagedRing = 2,  // staged pushes in neighbour order; world_size 4 and 8
+   kFlatStaged = 3,  // staged pushes without the island decomposition
++  kTrueRing = 4,    // dsv41: cut-through neighbour ring without barriers; world_size 4
+ };
+ 
+-constexpr int kVariantCount = 4;
++constexpr int kVariantCount = 5;
+ 
+ // Which staging area a kernel uses. The kernels come in two protocol families
+ // and a region may hold only one of them.
+@@ -2098,6 +2099,81 @@
+   return views;
+ }
+ 
++// dsv41 (ds41-patches/patch_true_ring.py): cut-through neighbour ring, world_size 4, 16-bit payloads, kBlock region.
++// Every rank only ever writes to rank + 1, and there are no barriers: each pack carries its own arrival signal (the
++// sentinel protocol above), so it moves on to the next hop as soon as it lands. Reduce-scatter and all-gather are one
++// 2*(WorldSize-1)-hop chain per pack, run stage-major so every pack is in flight at once. Chunk c is summed in ring
++// order starting at rank c + 1 (bf16 adds, as in the staged kernels). Each slot is written by exactly one sender and
++// read once by its owner, which resets it right away, so the region is clean on exit. The epoch double buffer is safe
++// without barriers: a rank starts call n + 2 only after call n + 1's all-gather reached it, which its neighbour sent
++// after finishing call n.
++template <typename T, int WorldSize, bool UsePdl>
++__global__ __launch_bounds__(1024, 1) void ipc_true_ring_param_kernel(
++    const PushOneshotParamData<T> __grid_constant__ params) {
++  static_assert(sizeof(T) == 2, "16-bit payloads only");
++  pdl_grid_sync_const<UsePdl>();
++  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
++  const int epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
++  const int rank = params.rank;
++  const int part = params.num_packs / WorldSize;
++  const int slot_stride = part + params.num_packs % WorldSize;  // the last chunk is the largest
++  uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
++  uint4* output = reinterpret_cast<uint4*>(params.output);
++  uint4* local = reinterpret_cast<uint4*>(params.tmp_ptrs[rank]) + epoch * params.epoch_stride_packs;
++  uint4* remote =
++      reinterpret_cast<uint4*>(params.tmp_ptrs[(rank + 1) % WorldSize]) + epoch * params.epoch_stride_packs;
++  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++  const int stride = gridDim.x * blockDim.x;
++  const uint4 reset = {0u, 0u, 0u, 0u};
++  // Reduce-scatter. Step 0 sends this rank's input of chunk (rank - 1); step s receives the partial sum of chunk
++  // (rank - 1 - s), adds this rank's input and forwards it. Step WorldSize - 1 completes this rank's own chunk.
++  {
++    const int c = (rank + WorldSize - 1) % WorldSize;
++    const int base = c * part, len = c == WorldSize - 1 ? params.num_packs - base : part;
++    for (int i = tid; i < len; i += stride) {
++      store_u4_volatile(remote, i, clear_pos_zero_u4_16(input[base + i]));
++    }
++  }
++#pragma unroll
++  for (int s = 1; s < WorldSize; ++s) {
++    const int c = (rank + 2 * WorldSize - 1 - s) % WorldSize;
++    const int base = c * part, len = c == WorldSize - 1 ? params.num_packs - base : part;
++    uint4* in_slot = local + (s - 1) * slot_stride;
++    for (int i = tid; i < len; i += stride) {
++      uint4 v;
++      do {
++        v = load_u4_volatile(in_slot, i);
++      } while (has_pos_zero_u4_16(v));
++      store_u4_volatile(in_slot, i, reset);
++      v = packed_add_u4<T>(v, input[base + i]);
++      if (s == WorldSize - 1) {
++        output[base + i] = v;
++      }
++      store_u4_volatile(remote + s * slot_stride, i, clear_pos_zero_u4_16(v));
++    }
++  }
++  // All-gather. Step t receives the final chunk (rank - 1 - t) and forwards it unless this is its last hop.
++#pragma unroll
++  for (int t = 0; t < WorldSize - 1; ++t) {
++    const int c = (rank + 2 * WorldSize - 1 - t) % WorldSize;
++    const int base = c * part, len = c == WorldSize - 1 ? params.num_packs - base : part;
++    uint4* in_slot = local + (WorldSize - 1 + t) * slot_stride;
++    for (int i = tid; i < len; i += stride) {
++      uint4 v;
++      do {
++        v = load_u4_volatile(in_slot, i);
++      } while (has_pos_zero_u4_16(v));
++      store_u4_volatile(in_slot, i, reset);
++      output[base + i] = v;
++      if (t < WorldSize - 2) {
++        store_u4_volatile(remote + (WorldSize + t) * slot_stride, i, v);
++      }
++    }
++  }
++  debug_commit_per_block_epoch(epoch_slot, epoch);
++  pdl_grid_release_const<UsePdl>();
++}
++
+ template <typename Kernel, typename... Args>
+ inline cudaError_t launch(Kernel kernel, dim3 grid, dim3 block, cudaStream_t stream, bool use_pdl,
+                           Args const&... args) {
+@@ -2226,6 +2302,12 @@
+         return FI_PCIE_IPC_LAUNCH((ipc_rsag_push_param_kernel<T, 4, PDL>), PDL);           \
+       case Variant::kStagedRing:                                                           \
+         return FI_PCIE_IPC_LAUNCH((ipc_rsag_ring_push_param_kernel<T, 4, PDL>), PDL);      \
++      case Variant::kTrueRing:                                                             \
++        if constexpr (sizeof(T) == 2) {                                                    \
++          return FI_PCIE_IPC_LAUNCH((ipc_true_ring_param_kernel<T, 4, PDL>), PDL);         \
++        } else {                                                                           \
++          return FI_PCIE_IPC_LAUNCH((ipc_rsag_ring_push_param_kernel<T, 4, PDL>), PDL);    \
++        }                                                                                  \
+       default:                                                                             \
+         return cudaErrorInvalidValue;                                                      \
+     }                                                                                      \
+diff -ruN a/jit/comm.py b/jit/comm.py
+--- a/jit/comm.py
++++ b/jit/comm.py
+@@ -264,7 +264,8 @@
+     # for. The target is a PCIe machine without NVLink, which is orthogonal to
+     # the SM version.
+     return gen_jit_spec(
+-        "pcie_ipc_comm",
++        # glm53-flash-exp:truering: own JIT module name, so the patched build never shares a cache dir with stock
++        "pcie_ipc_comm_truering",
+         [
+             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
+         ],

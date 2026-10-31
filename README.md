@@ -12,6 +12,20 @@
   <img alt="licence" src="https://img.shields.io/badge/recipe-MIT-blue?style=flat">
 </p>
 
+> **This is a fork** of [Morrowmake/glm53-flash-cmp170hx-recipe](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe)
+> 1.8.0 by [JerricP](https://github.com/JerricP). Everything below is Morrowmake's recipe, unchanged, plus two
+> optional changes:
+>
+> - **True-ring all-reduce** ([docs/true-ring.md](docs/true-ring.md)): the TP4 decode all-reduce on FlashInfer's PCIe
+>   IPC all-reduce with [GNmac-lab](https://github.com/GNmac-lab/deepseek-v41-flash-1017-cmp170hx)'s cut-through ring,
+>   in an image built from the pinned one by [`truering/build.sh`](truering/build.sh). On one EPYC Rome board with one
+>   GPU per root complex: decode all-reduce 42 → 20 us, single-user decode +8-14 %, 4/8 users +10/+12 %, prefill
+>   unchanged. Output stays deterministic but is not bitwise identical to the release (bf16 ring sum). Off unless you
+>   build the image and set three lines in `.env`.
+> - **Faster restarts**: Python bytecode is kept under `cache/pycache` (same change as upstream PR #19).
+>
+> The figures in the rest of this README are Morrowmake's, not this fork's.
+
 **A 320B-parameter MoE with a 262,144-token context, served on four CMP 170HX
 cards in two layouts. Release 1.8.0 tensor-parallel results with verified peer-to-peer at 74 SMs:
 482.6 tok/s for one user and 943.7 tok/s across eight,
