@@ -44,7 +44,9 @@ loudly if the pin moves to a FlashInfer it was not made for. Nothing else in the
 One machine: EPYC 7302 (Rome), 96 GB DDR4-3200, 4x CMP 170HX, PCIe Gen2 x16, each GPU on a different root complex.
 Recipe 1.8.0, TP4, DFlash2 (release adaptive depth), `MAX_SEQS=8`, `MM_CAP=1`, `P2P=auto`,
 `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=0`, `NCCL_P2P_LEVEL=SYS`. On this board the flags-in-data custom all-reduce (full
-P2P) measured 5-15 % slower end to end than `HOSTSHM`.
+P2P) measured 5-15 % slower end to end than `HOSTSHM`. All numbers are at a 140 W power cap per card. At 160 W,
+single-user decode was about 5-10 % faster, and 4-8 users were unchanged
+([re-apply record, section 9](tuning/APPLY-ON-NEW-RELEASE.md#9-power-cap-140-w-vs-160-w-user-run-2026-10-31)).
 
 **Where the decode step goes** (torch profiler, one user, 400-token decode, rank 0): verify step 18.4 ms; all-reduce
 26 % (`HOSTSHM`, 46-52 us per call in place), bf16 dense projections 27 %, MoE 21 %, attention 12 %, norms/mHC 9 %,

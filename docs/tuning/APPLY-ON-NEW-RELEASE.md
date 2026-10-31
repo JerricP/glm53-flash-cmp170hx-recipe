@@ -30,7 +30,7 @@ checked. "Not recorded" means none of these sources has it.
 
 **Deliberately NOT changed:** power limits, clocks, fans, BIOS, driver, kernel parameters, `cmp-powerlimit.service`,
 `cmp170-manager`. All numbers below are at the 140 W cap. Peak temperatures across both sessions: core 73 C, HBM 78 C
-(limits 80 C / 88 C; no alerts).
+(limits 80 C / 88 C; no alerts). The cap stays at 140 W; section 9 has a user-run comparison with 160 W.
 
 ---
 
@@ -356,3 +356,45 @@ DS-specific notes for later:
 | Microbench `ring_ar.cu` (adapted to hidden 4096) | GNmac-lab | MIT | `~/ring_ar.cu`, `~/engine-work/ring_ar_4096.patch` |
 
 Detailed logs: `~/tuning-log.md` (phase 1), `~/engine-log.md` (phase 2), `docs/true-ring.md` (fork doc).
+
+---
+
+## 9. Power cap: 140 W vs 160 W (user-run, 2026-10-31)
+
+GLM on the ring config (section 3), TP4, `MAX_SEQS=8`. The user changed the limit at runtime with
+`sudo nvidia-smi -pl <W>`. `cmp-powerlimit.service` was not touched, so a reboot restores 140 W.
+
+**Concurrency** (`conc.py`: 400-token decodes, three rounds per user count; same session, 160 W then 140 W),
+total tok/s:
+
+| Users | 160 W (runs) | 140 W (runs) | 160 W vs 140 W |
+|---:|---|---|---:|
+| 1 | 226 (216, 226, 229) | 212 (212, 196, 230) | +6.6% |
+| 2 | 356 (356, 365, 346) | 340 (340, 328, 355) | +4.7% |
+| 4 | 515 (525, 515, 504) | 511 (518, 511, 493) | +0.8% |
+| 8 | 726 (726, 710, 758) | 725 (725, 748, 707) | +0.1% |
+
+**Single user** (`bench.py`, second of two runs). 160 W was measured on 2026-10-31. The 140 W numbers are the two ring
+boots from phase 2, an earlier session:
+
+| Metric | 140 W | 160 W | Change |
+|---|---|---:|---:|
+| Decode structured (tok/s) | 442.3 / 430.4 | 471.7 | +7 to +10% |
+| Decode code | 333.8 / 340.2 | 346.4 | within the ±15% noise |
+| Decode prose | 233.7 / 222.6 | 247.5 | +6 to +11% |
+| 32k cold prefill (tok/s) | 3,095-3,103 | 3,162 | +2% |
+
+**Reading:**
+- 160 W makes 1-2-user decode roughly 5-10% faster and prefill about 2% faster.
+- At 4-8 users it changes nothing, because batched decode is not limited by the power cap on this machine.
+- Not adopted: the machine stays at 140 W.
+
+**Caveats:**
+- The single-user comparison spans two sessions.
+- No power-draw or temperature log was running during these runs, so it is not known how often the cards reached the cap, or how much hotter 160 W runs.
+- The 140 W single-user `conc.py` rounds spread from 196 to 230 tok/s.
+
+**To confirm it:**
+- Run `~/engine-work/templog.sh` (logs power draw and temperatures).
+- Alternate 140 → 160 → 140 → 160 W in one session, with `bench.py` ×2 and `conc.py 1,2,8` at each step.
+- Keep the 80 C core / 88 C HBM stop rule.
