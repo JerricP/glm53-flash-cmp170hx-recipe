@@ -266,11 +266,11 @@ effort: skipped by user, nothing measured.
 
 ---
 
-## 7. Does it apply to DeepSeek? (UNTESTED)
+## 7. Does it apply to DeepSeek? (only the ring was tested; see 7a)
 
 Target: `~/Documents/dsv41-flash-cmp170hx-recipe` (at `7f9023c`, image
-`ghcr.io/morrowmake/vllm-cmp170hx@sha256:f67d9be47ffbd4a8b84c77fe76bdb3f842187d9b2786fff573e390ae5361bfb0`). Nothing
-below was run on DeepSeek; the checks were read-only file inspections on 2026-10-31.
+`ghcr.io/morrowmake/vllm-cmp170hx@sha256:f67d9be47ffbd4a8b84c77fe76bdb3f842187d9b2786fff573e390ae5361bfb0`). Apart
+from the true ring (tested, slower, section 7a), the rows below are read-only file inspections from 2026-10-31.
 
 | Item | Should transfer? | What to check first |
 |---|---|---|
@@ -278,8 +278,69 @@ below was run on DeepSeek; the checks were read-only file inspections on 2026-10
 | Hybrid P2P (`P2P=auto`, `VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=0`, `NCCL_P2P_LEVEL=SYS`) | Probably. The DS recipe has the same switches; `VLLM_HOST_ALLREDUCE` defaults to 1 | Measure hybrid vs full P2P on DS; do not assume GLM's result |
 | `MM_CAP=1` | No. The DS `.env.advanced.example` has no `MM_CAP` | — |
 | `MAX_BATCHED` findings | No. Model-specific (DS default `2048`) | Re-measure if wanted |
-| True ring | Plausible. The ring was written for DeepSeek-V4.1 messages ([M, 5120] in GNmac-lab's `ring_ar.cu`). In the DS image the five FlashInfer files apply the patch cleanly (`--dry-run`); `pcie_ipc_all_reduce.cu` and `pcie_ipc_policy.py` are byte-identical to GLM 1.8.0's; the vLLM wrapper exists; `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC` is in its `envs.py`; and its sm80 communicator has the same HOSTSHM conflict guard (so `VLLM_HOST_ALLREDUCE=0` is still required) | Build with `BASE=<DS digest> TAG=dsv41-flash-exp:truering ./truering/build.sh`, select it with `IMAGE=` in the DS `.env`, then run all of section 4e with a DS greedy reference. `greedy_check.py` hard-codes `MODEL = "GLM5.3-Flash"` and needs the DS served name |
+| True ring | **No: tested, 5-7% slower decode on DS** (section 7a). It builds and runs correctly there | Do not apply to DS without first finding out why (profile one DS decode step) |
 | Task 3 ideas | Not applicable as written (GLM-specific kernels) | — |
+
+### 7a. DeepSeek true-ring test (2026-10-31): reverted
+
+Same method as GLM phase 2. Baseline = the DS `.env` as it was (HOSTSHM). Ring = the same four lines with
+`IMAGE=dsv41-flash-exp:truering`. `~/bench_ds.py` (thinking off) three times each.
+
+| Metric | Baseline (HOSTSHM) | Ring | Change |
+|---|---:|---:|---:|
+| Decode structured (tok/s), 3 runs | 247.2 / 248.4 / 245.6 | 231.6 / 233.3 / 232.2 | **−6%** |
+| Decode code | 232.4 / 234.5 / 232.5 | 220.6 / 221.4 / 221.7 | −5% |
+| Decode prose | 129.8 / 130.9 / 128.0 | 113.5 / 123.6 / 118.9 | **−7%** |
+| Prefill 32k (tok/s) | 3,676-3,718 | 3,810-3,861 | +3.5% |
+| Decode step | 23.4-23.9 ms | 25.0-25.4 ms | +1.5 ms |
+| Aggregate 1 / 4 / 8 users (tok/s) | 121 / 257 / 337 | 113 / 254 / 342 | −7% / −1% / +1% |
+| KV pool (tokens) | 1,240,955 | 1,220,630 | −20,325 |
+| Start to healthy | 544 s | 642 s (first start, includes the JIT build) | |
+
+DS run-to-run spread was small (structured and code ~1%, prose ~±4%), so the loss is outside the noise.
+
+What worked:
+- Step 1 passed. Both images have FlashInfer 0.7.0.post1, the five PCIe IPC files and vLLM's wrapper are
+  byte-identical, and the patch applies.
+- The image was built with `BASE=<DS digest> TAG=dsv41-flash-exp:truering ./truering/build.sh` (`sha256:350a8834497b…`).
+  It uses the same module rename, and its JIT cache sits in the DS checkout's `cache/`.
+- Boot check PASS; smoke ok; tp:0 `['FLASHINFER_PCIE_IPC', 'PYNCCL']`; startup tune picked TRUE_RING for every
+  capture size 2-48; no retired-name warnings.
+- Greedy, thinking off (`GC_MODEL=DS4.1-Flash GC_EXTRA='{"chat_template_kwargs": {"thinking": false}}'`): the ring
+  is deterministic (20/20). Against the baseline, 3/20 prompts are identical. All 17 divergences are at a baseline
+  margin of 0.014-0.913 nats (median 0.197); 9.0% of baseline tokens have a margin ≤ 1.0.
+
+Decision: structured and prose are slower, so it was reverted. The DS `.env` is identical to `.env.before-ring` again.
+The image `dsv41-flash-exp:truering` is kept but unused.
+
+**Why it is slower (confirmed 2026-10-31, all-reduce call counter, not a profiler).** DS sends the attention
+`wo_b` output all-reduce in **fp32** `[M, 5120]`: `VLLM_DEEPSEEK_V41_WO_B_BF16_ALLREDUCE` (on by default) switches it
+to bf16 only when vLLM's custom all-reduce takes it, and that path is disabled on this board. HOSTSHM accepts fp32;
+FlashInfer PCIe IPC accepts bf16 only. With HOSTSHM off, half of the decode all-reduces (twice the bytes) go to NCCL,
+plus a small bf16 `[M, 320]` call. The bf16 MoE output does go to the ring.
+
+Possible fixes, **parked until the DS recipe matures upstream** (user decision):
+
+| Option | Change | Estimated decode gain |
+|---|---|---:|
+| 1 | Keep HOSTSHM for fp32 and send bf16 `[M, 5120]` to the ring (relax the construction guard, add a dispatch rule) | ~+5% |
+| 2 | Send `wo_b` in bf16 whenever FlashInfer takes it, so everything uses the ring with HOSTSHM off | ~+12-13% at best |
+
+Both estimates come from a microbench at hidden 5120 (`AR_HID=5120 AR_DTYPE=… truering/tools/ar_bench.sh`).
+Option 2 trades the exact fp32 sum for a bf16 ring sum. On a new DS release, first check whether `wo_b_all_reduce` (in
+`sm80_attention.py`) still sends fp32 when the custom all-reduce is off. Details and the counter patch are in
+`~/engine-log.md` and `~/engine-work/ar_count_hook.patch`.
+
+**Do not run the full torch profiler on DS.** With the default Engram row cache (7 GiB per card), DS leaves only ~9 GiB
+of RAM available, and a 4-rank profiler run froze the machine. For tests, use `VLLM_ENGRAM_ROW_CACHE_GIB=3`
+(~52 GiB stays available).
+
+DS-specific notes for later:
+- `./start.sh status` in the DS recipe reports "models: missing or incomplete". This is a false alarm: the hybrid's
+  files are symlinks to container paths, so the host-side check fails. The start itself logs "hybrid: built,
+  skipping" and downloads nothing.
+- `greedy_check.py` in `~/engine-work/` now takes `GC_MODEL` and `GC_EXTRA`. The fork copy in `truering/tools/` does
+  not yet.
 
 ---
 

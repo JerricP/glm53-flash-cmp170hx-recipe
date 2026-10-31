@@ -6,14 +6,15 @@ The backend is chosen exactly as the server chooses it, by env (set by the calle
   custom   VLLM_HOST_ALLREDUCE=1 VLLM_CUSTOM_ALLREDUCE_PCIE_P2P=1 [VLLM_CUSTOM_ALLREDUCE_FLAGS=0|1] -> CUSTOM
   fipcie   VLLM_HOST_ALLREDUCE=0 VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1          -> FLASHINFER_PCIE_IPC
   nccl     VLLM_HOST_ALLREDUCE=0 and AR_NO_CUSTOM=1                                 -> PYNCCL
-Per shape [M, 4096] bf16: ITERS all-reduces captured back to back in one CUDA graph, replayed REPS times;
+Per shape [M, AR_HID (4096)] AR_DTYPE (bfloat16): ITERS all-reduces captured back to back in one CUDA graph, replayed REPS times;
 time per call = slowest rank's replay / ITERS, best of REPS. Correctness: result vs an fp64 sum of the
 four ranks' inputs (max abs error, and the share of elements that equal the exactly rounded bf16 sum).
 """
 import json, os, sys, time
 import torch, torch.distributed as dist
 
-HID = 4096
+HID = int(os.environ.get("AR_HID", "4096"))
+DT = getattr(torch, os.environ.get("AR_DTYPE", "bfloat16"))
 MS = [int(m) for m in os.environ.get("AR_MS", "1,2,4,6,8,16,32").split(",")]
 ITERS, REPS = int(os.environ.get("AR_ITERS", "200")), 7
 
@@ -45,14 +46,14 @@ def main():
         rows = []
         for M in MS:
             g = torch.Generator(device="cpu").manual_seed(1000 + M)
-            allx = [torch.randn(M, HID, generator=g).to(torch.bfloat16) for _ in range(world)]
+            allx = [torch.randn(M, HID, generator=g).to(DT) for _ in range(world)]
             x = allx[rank].to(dev)
             exact = sum(a.double() for a in allx)
-            ref_bf16 = exact.to(torch.bfloat16)
+            ref_bf16 = exact.to(DT)
             # eager correctness
             y = tp.all_reduce(x.clone()).float().cpu()
             err = (y.double() - exact).abs().max().item()
-            exact_share = (y.to(torch.bfloat16) == ref_bf16).float().mean().item()
+            exact_share = (y.to(DT) == ref_bf16).float().mean().item()
             # graph timing
             graph = torch.cuda.CUDAGraph()
             with ps.graph_capture(dev) as ctx:
@@ -74,7 +75,7 @@ def main():
                 best = min(best, t.item())
             # result of the captured calls must match the eager result bitwise
             gy = out.float().cpu()
-            rows.append({"M": M, "bytes": M * HID * 2, "us": 1000 * best / ITERS, "max_abs_err": err,
+            rows.append({"M": M, "bytes": M * HID * x.element_size(), "us": 1000 * best / ITERS, "max_abs_err": err,
                          "exact_bf16_share": exact_share, "graph_eq_eager": bool(torch.equal(gy, y))})
             del graph
         if rank == 0:

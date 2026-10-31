@@ -23,7 +23,7 @@ esac
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 args=()
-for kv in "${E[@]}" NCCL_P2P_LEVEL=SYS AR_LABEL="$1" HOME=/out TMPDIR=/out VLLM_CACHE_ROOT=/out/vllm \
+for kv in "${E[@]}" NCCL_P2P_LEVEL=SYS AR_LABEL="$1" AR_HID="${AR_HID:-4096}" AR_DTYPE="${AR_DTYPE:-bfloat16}" AR_MS="${AR_MS:-1,2,4,6,8,16,32}" HOME=/out TMPDIR=/out VLLM_CACHE_ROOT=/out/vllm \
           PYTHONDONTWRITEBYTECODE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False; do args+=(-e "$kv"); done
 docker run --rm --user "$(id -u):$(id -g)" --gpus all --shm-size 16g -v "$HERE:/work:ro" -v "$out:/out" "${args[@]}" \
   --entrypoint torchrun "$IMG" --nproc-per-node 4 /work/ar_bench.py 2>&1 | grep -E "^$1 "
